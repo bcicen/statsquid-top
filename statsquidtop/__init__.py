@@ -1,76 +1,156 @@
 import os
 import sys
+import ssl
+import json
 import signal
 import curses
+import websocket
+from time import sleep
 from copy import deepcopy
 from datetime import datetime
-from redis import StrictRedis
+from threading import Thread
 from argparse import ArgumentParser
 from curses.textpad import Textbox,rectangle
 
-from statsquidtop.menu import run_menu
-from statsquidtop.util import format_bytes, unix_time, convert_type
+#from statsquidtop.menu import run_menu
+from util import format_bytes
 
-key_prefix = 'statsquid'
+version = '0.1'
+_startcol = 2
+
+columns = [
+        {
+            'header': 'NAME',
+            'width': 20,
+            'value_func': lambda x: x['Names'][0].strip('/'),
+            'sort_func': None
+        },
+        {
+            'header': 'CPU %',
+            'width': 8,
+            'value_func': lambda x: round(x['CPUPercentage'], 2),
+            'sort_func': None
+        },
+        {
+            'header': 'MEM',
+            'width': 10,
+            'value_func': lambda x: format_bytes(x['memory_stats']['usage']),
+            'sort_func': None
+        },
+        {
+            'header': 'NET TX',
+            'width': 10,
+            'value_func': lambda x: format_bytes(x['TxBytesTotal']),
+            'sort_func': None
+        },
+        {
+            'header': 'NET RX',
+            'width': 10,
+            'value_func': lambda x: format_bytes(x['RxBytesTotal']),
+            'sort_func': None
+        },
+        {
+            'header': 'IO READ',
+            'width': 10,
+            'value_func': lambda x: format_bytes(x['IoReadBytesTotal']),
+            'sort_func': None
+        },
+        {
+            'header': 'IO WRITE',
+            'width': 10,
+            'value_func': lambda x: format_bytes(x['IoWriteBytesTotal']),
+            'sort_func': None
+        },
+        {
+            'header': 'NODE',
+            'width': 11,
+            'value_func': lambda x: x['NodeName'],
+            'sort_func': None
+        }
+    ]
+
+class StatSquidClient(object):
+    def __init__(self, url):
+        self.eventQ = []
+
+        self._url = url
+        self._thread = Thread(target=self._open)
+        self._thread.daemon = True
+        self._thread.start()
+
+    def _open(self):
+        self._send_id = 0
+        self.ws = websocket.WebSocketApp(self._url,
+                                         on_message=self._event_handler,
+                                         on_error=self._error_handler,
+                                         on_open=self._open_handler,
+                                         on_close=self._exit_handler)
+        self.ws.run_forever(sslopt={'cert_reqs': ssl.CERT_NONE})
+
+    def _event_handler(self, ws, event_bytes):
+        event_str = event_bytes.decode('UTF-8')
+        self.eventQ.append(json.loads(event_str))
+
+    def _open_handler(self, ws):
+        self.connected = True
+
+    def _error_handler(self, ws, error):
+        log.critical('websocket error:\n %s' % error)
+
+    def _exit_handler(self, ws):
+        log.warn('websocket connection closed')
 
 class StatSquidTop(object):
-    def __init__(self, redis_host, redis_port, filter=None, sort_key=None):
-        self.redis  = StrictRedis(host=redis_host,
-                                  port=redis_port,
-                                  decode_responses=True)
+    def __init__(self, mantle_host, filter=None, sort_key=None):
+        self.client = StatSquidClient('ws://%s/ws' % mantle_host)
+        self.containers = {}
 
         #set initial display options
         self.sums = False
         self.filter = filter
         self.sort = { 'key': sort_key, 'reversed': True }
 
-        self.keys   = {
-            'name'   : str,
-            'source' : str,
-            'id'     : str,
-            'cpu'    : float,
-            'mem'    : float,
-            'last_read'            : float,
-            'stats_read'           : float,
-            'net_rx_bytes_total'   : float,
-            'net_tx_bytes_total'   : float,
-            'io_read_bytes_total'  : float,
-            'io_write_bytes_total' : float
-        }
-        self.valid_filters = [ k for k,v in list(self.keys.items()) if v == str ]
-
         self.stats  = {}
         while True:
-            self.poll()
+            self.read_from_queue()
             self.display()
 
     def sig_handler(self, signal, frame):
         curses.endwin()
         sys.exit(0)
 
-    def poll(self):
-        last_stats = deepcopy(self.stats)
-        self.stats = {}
+    def read_from_queue(self):
+        while True:
+            try:
+                event = self.client.eventQ.pop(0)
+            except IndexError:
+                break
+            self.containers[event['ID']] = event
 
-        #populate self.stats with all containers
-        for key in list(self.redis.keys(key_prefix + ':*')):
-            container = self._get_container(key)
-            if container:
-                self.stats[container['id']] = container
-
-        if self.sums:
-            self.display_stats = deepcopy(list(self.stats.values()))
-        else:
-            self.display_stats = self._diff_stats(self.stats,last_stats)
-
-        if self.sort['key']:
-            self.display_stats = sorted(self.display_stats,
-                    key=self._sorter,reverse=self.sort['reversed'])
-
-        if self.filter:
-            ftype,fvalue = self.filter.split(':')
-            self.display_stats = [ s for s in self.display_stats \
-                                         if fvalue in s[ftype] ]
+#        last_stats = deepcopy(self.stats)
+#        self.stats = {}
+#
+#        #read all in incoming_stats queue
+#        while True:
+#            try:
+#                stat = incoming_stats.pop(0)
+#                self.stats[stat['ID']] = stat
+#            except IndexError:
+#                break
+#
+#        if self.sums:
+#            self.display_stats = deepcopy(list(self.stats.values()))
+#        else:
+#            self.display_stats = self._diff_stats(self.stats,last_stats)
+#
+#        if self.sort['key']:
+#            self.display_stats = sorted(self.display_stats,
+#                    key=self._sorter,reverse=self.sort['reversed'])
+#
+#        if self.filter:
+#            ftype,fvalue = self.filter.split(':')
+#            self.display_stats = [ s for s in self.display_stats \
+#                                         if fvalue in s[ftype] ]
 
     def display(self):
         s = curses.initscr()
@@ -84,39 +164,35 @@ class StatSquidTop(object):
         s.clear()
        
         #first line
-        s.addstr(1, 2, 'statsquid top -')
+        s.addstr(1, 2, 'statsquid-top -')
         s.addstr(1, 18, datetime.now().strftime('%H:%M:%S'))
-        s.addstr(1, 28, ('%s containers' % len(self.display_stats)))
+        s.addstr(1, 28, ('%s containers' % len(self.containers)))
         if self.filter:
             s.addstr(1, 42, ('filter: %s' % self.filter))
 
-        #second line
-        s.addstr(3, 2, "NAME", curses.A_BOLD)
-        s.addstr(3, 25, "ID", curses.A_BOLD)
-        s.addstr(3, 41, "CPU", curses.A_BOLD)
-        s.addstr(3, 48, "MEM", curses.A_BOLD)
-        s.addstr(3, 58, "NET TX", curses.A_BOLD)
-        s.addstr(3, 68, "NET RX", curses.A_BOLD)
-        s.addstr(3, 78, "READ IO", curses.A_BOLD)
-        s.addstr(3, 88, "WRITE IO", curses.A_BOLD)
-        s.addstr(3, 98, "SOURCE", curses.A_BOLD)
+        #second line, column headers
+        x_pos = _startcol
+        for c in columns:
+            s.addstr(3, x_pos, c['header'], curses.A_BOLD)
+            x_pos += c['width']
 
         #remainder of lines
-        line = 5
+        y_pos = 5
         maxlines = h - 2
-        for stat in self.display_stats:
-            s.addstr(line, 2,  stat['name'][:20])
-            s.addstr(line, 25, stat['id'][:12])
-            s.addstr(line, 41, str(stat['cpu']))
-            s.addstr(line, 48, format_bytes(stat['mem']))
-            s.addstr(line, 58, format_bytes(stat['net_tx_bytes_total']))
-            s.addstr(line, 68, format_bytes(stat['net_rx_bytes_total']))
-            s.addstr(line, 78, format_bytes(stat['io_read_bytes_total']))
-            s.addstr(line, 88, format_bytes(stat['io_write_bytes_total']))
-            s.addstr(line, 98, stat['source'])
-            if line >= maxlines:
+
+        for _, container in self.containers.items():
+            x_pos = _startcol
+            for c in columns:
+                value = str(c['value_func'](container))
+                if len(value) >= c['width']:
+                    value = self._truncate(value, c['width'])
+                s.addstr(y_pos, x_pos, value)
+                x_pos += c['width']
+            if y_pos >= maxlines:
                 break
-            line += 1
+            else:
+                y_pos += 1
+
         s.refresh()
 
         x = s.getch()
@@ -152,11 +228,8 @@ class StatSquidTop(object):
         if x == ord('s'):
             startx = w / 2 - 20 # I have no idea why this offset of 20 is needed
 
-            #format field names for readable output
-            opts = list(self.keys.keys())
-            fmt_opts = [k.replace('_',' ').replace('total','') for k in opts]
-
-            selected = run_menu(tuple(fmt_opts),x=startx,y=6,name="sort")
+            opts = [ c['header'] for c in columns ]
+            selected = run_menu(tuple(opts), x=startx, y=6, name="sort")
             self.sort['key'] = opts[selected]
 
         if x == ord('f'):
@@ -183,6 +256,9 @@ class StatSquidTop(object):
                 s.refresh()
                 curses.napms(800)
 
+    def _truncate(self, s, max_len):
+        i = max_len - 4
+        return s[:i] + '...'
 
     def _sorter(self,d):
         return d[self.sort['key']]
@@ -200,79 +276,15 @@ class StatSquidTop(object):
 
         return True
 
-    def _get_container(self, key):
-        """
-        Fetch all fields in a hash key from redis, mapping to types defined
-        in self.keys. Return None if any keys are missing or last update
-        was > 10s ago.
-        """
-        now = unix_time(datetime.utcnow())
-        container = self.redis.hgetall(key)
-
-        if False in [k in container for k in self.keys]:
-            return None
-
-        stat = { k:convert_type(container[k],t) for \
-                    k,t in list(self.keys.items()) }
-
-        if now - stat['last_read'] > 10:
-            return None
-
-        return stat
-
-    def _diff_stats(self,new_stats,last_stats):
-        stats = deepcopy(new_stats)
-        for cid in stats:
-            if cid in last_stats:
-                stats[cid] = self._diff_cid(stats[cid],last_stats[cid])
-            else:
-                stats[cid] = self._zero_stat(stats[cid])
-        
-        return list(stats.values())
-
-    def _zero_stat(self,stat):
-        for k in [ k for k in self.keys if '_total' in k ]:
-            stat[k] = 0
-        return stat
-
-    def _diff_cid(self,stat,last_stat):
-        time_delta = stat['last_read'] - last_stat['last_read']
-        diffdict = { k:(last_stat[k],stat[k],time_delta) for \
-                        k in self.keys if '_total' in k }
-        for k,v in list(diffdict.items()):
-            stat[k] = self._get_delta(*v)
-
-        return stat
-
-    def _get_delta(self,old,new,elapsed):
-        delta = new - old
-        if elapsed > 1 and delta != 0:
-            return int(round(delta / elapsed))
-        else:
-            return delta
-
 def main():
-    envvars = { 'STATSQUID_REDIS' : 'redis' }
-
-    parser = ArgumentParser(description='statsquid top v%s' % version)
-    parser.add_argument('--redis',
-                        dest='redis',
-                        help='redis host to connect to (127.0.0.1:6379)',
-                        default='127.0.0.1:6379')
+    parser = ArgumentParser(description='statsquid-top v%s' % version)
+    parser.add_argument('--mantle',
+                        dest='mantle',
+                        help='mantle host to connect to (127.0.0.1:1234)',
+                        default='127.0.0.1:1234')
 
     args = parser.parse_args()
-
-    #override command line with env vars
-    [ args.__setattr__(v,os.getenv(k)) for k,v in \
-            list(envvars.items()) if os.getenv(k) ]
-
-    if ':' in args.redis:
-        redis_host,redis_port = args.redis.split(':')
-    else:
-        redis_host = args.redis
-        redis_port = 6379
-
-    StatSquidTop(redis_host, redis_port)
+    StatSquidTop(args.mantle)
 
 if __name__ == '__main__':
     main()
