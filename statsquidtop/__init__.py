@@ -12,62 +12,12 @@ from threading import Thread
 from argparse import ArgumentParser
 from curses.textpad import Textbox,rectangle
 
-#from statsquidtop.menu import run_menu
+from menu import run_menu
 from util import format_bytes
+from columns import columns, hidden_columns
 
 version = '0.1'
 _startcol = 2
-
-columns = [
-        {
-            'header': 'NAME',
-            'width': 20,
-            'value_func': lambda x: x['Names'][0].strip('/'),
-            'sort_func': None
-        },
-        {
-            'header': 'CPU %',
-            'width': 8,
-            'value_func': lambda x: round(x['CPUPercentage'], 2),
-            'sort_func': None
-        },
-        {
-            'header': 'MEM',
-            'width': 10,
-            'value_func': lambda x: format_bytes(x['memory_stats']['usage']),
-            'sort_func': None
-        },
-        {
-            'header': 'NET TX',
-            'width': 10,
-            'value_func': lambda x: format_bytes(x['TxBytesTotal']),
-            'sort_func': None
-        },
-        {
-            'header': 'NET RX',
-            'width': 10,
-            'value_func': lambda x: format_bytes(x['RxBytesTotal']),
-            'sort_func': None
-        },
-        {
-            'header': 'IO READ',
-            'width': 10,
-            'value_func': lambda x: format_bytes(x['IoReadBytesTotal']),
-            'sort_func': None
-        },
-        {
-            'header': 'IO WRITE',
-            'width': 10,
-            'value_func': lambda x: format_bytes(x['IoWriteBytesTotal']),
-            'sort_func': None
-        },
-        {
-            'header': 'NODE',
-            'width': 11,
-            'value_func': lambda x: x['NodeName'],
-            'sort_func': None
-        }
-    ]
 
 class StatSquidClient(object):
     def __init__(self, url):
@@ -101,19 +51,28 @@ class StatSquidClient(object):
         log.warn('websocket connection closed')
 
 class StatSquidTop(object):
-    def __init__(self, mantle_host, filter=None, sort_key=None):
+    def __init__(self, mantle_host, filter=None):
         self.client = StatSquidClient('ws://%s/ws' % mantle_host)
-        self.containers = {}
 
-        #set initial display options
+        self.containers = {}
+        self.selected_container = None
+        self.container_zoom = False
+
+        self.cursor_pos = 0
+        self.scroll_pos = 0
+
         self.sums = False
         self.filter = filter
-        self.sort = { 'key': sort_key, 'reversed': True }
+        self.sort = { 'func': lambda x: x['Names'][0].strip('/'), 'reversed': False }
 
-        self.stats  = {}
+        signal.signal(signal.SIGINT, self.sig_handler)
+
         while True:
             self.read_from_queue()
-            self.display()
+            if self.container_zoom:
+                self.display_container()
+            else:
+                self.display()
 
     def sig_handler(self, signal, frame):
         curses.endwin()
@@ -127,40 +86,15 @@ class StatSquidTop(object):
                 break
             self.containers[event['ID']] = event
 
-#        last_stats = deepcopy(self.stats)
-#        self.stats = {}
-#
-#        #read all in incoming_stats queue
-#        while True:
-#            try:
-#                stat = incoming_stats.pop(0)
-#                self.stats[stat['ID']] = stat
-#            except IndexError:
-#                break
-#
-#        if self.sums:
-#            self.display_stats = deepcopy(list(self.stats.values()))
-#        else:
-#            self.display_stats = self._diff_stats(self.stats,last_stats)
-#
-#        if self.sort['key']:
-#            self.display_stats = sorted(self.display_stats,
-#                    key=self._sorter,reverse=self.sort['reversed'])
-#
-#        if self.filter:
-#            ftype,fvalue = self.filter.split(':')
-#            self.display_stats = [ s for s in self.display_stats \
-#                                         if fvalue in s[ftype] ]
-
     def display(self):
         s = curses.initscr()
         curses.noecho()
         curses.curs_set(0)
-        s.timeout(1000)
         s.border(0)
+        s.keypad(1)
+        s.timeout(1000)
 
         h,w = s.getmaxyx()
-        signal.signal(signal.SIGINT, self.sig_handler)
         s.clear()
        
         #first line
@@ -180,13 +114,20 @@ class StatSquidTop(object):
         y_pos = 5
         maxlines = h - 2
 
-        for _, container in self.containers.items():
+        for i, container in enumerate(self._format_containers()):
             x_pos = _startcol
             for c in columns:
                 value = str(c['value_func'](container))
+                if c['is_bytes']:
+                    value = format_bytes(value)
                 if len(value) >= c['width']:
                     value = self._truncate(value, c['width'])
-                s.addstr(y_pos, x_pos, value)
+                if i == self.cursor_pos:
+                    style = curses.A_REVERSE+curses.A_BOLD
+                    self.selected_container = container['ID']
+                else:
+                    style = curses.A_NORMAL
+                s.addstr(y_pos, x_pos, value, style)
                 x_pos += c['width']
             if y_pos >= maxlines:
                 break
@@ -202,7 +143,7 @@ class StatSquidTop(object):
 
         if x == ord('h') or x == ord('?'):
             s.clear()
-            startx = w / 2 - 20 # I have no idea why this offset of 20 is needed
+            startx = int(w / 2 - 25) # I have no idea why this offset of 20 is needed
 
             s.addstr(6, startx+1, 'statsquid top version %s' % version)
             s.addstr(8, startx+1, 'c - toggle between cumulative and current view')
@@ -226,14 +167,14 @@ class StatSquidTop(object):
             self.sort['reversed'] = not self.sort['reversed']
 
         if x == ord('s'):
-            startx = w / 2 - 20 # I have no idea why this offset of 20 is needed
+            startx = int(w / 2 - 20)
 
             opts = [ c['header'] for c in columns ]
             selected = run_menu(tuple(opts), x=startx, y=6, name="sort")
-            self.sort['key'] = opts[selected]
+            self.sort['func'] = columns[selected]['value_func']
 
         if x == ord('f'):
-            startx = w / 2 - 20 # I have no idea why this offset of 20 is needed
+            startx = int(w / 2 - 20)
 
             s.addstr(6, startx, 'String to filter for:')
 
@@ -256,12 +197,68 @@ class StatSquidTop(object):
                 s.refresh()
                 curses.napms(800)
 
+        ####
+        # Cursor scrolling / selection
+        ####
+
+        maxcursor = maxlines - 6
+
+        if x == curses.KEY_DOWN:
+            if self.scroll_pos < len(self.containers) - maxcursor:
+                if self.cursor_pos >= maxcursor:
+                    self.scroll_pos += 1
+            if self.cursor_pos < len(self.containers):
+                self.cursor_pos += 1
+
+        if x == curses.KEY_UP:
+            if self.cursor_pos <= maxcursor and self.scroll_pos > 1:
+                self.scroll_pos -= 1
+            if self.cursor_pos >= 1:
+                self.cursor_pos -= 1
+
+
+        if x == ord('\n') or x == 32 :
+            self.container_zoom = True
+
+    def display_container(self):
+        s = curses.initscr()
+        curses.noecho()
+        curses.curs_set(0)
+        s.border(0)
+        s.keypad(1)
+        s.timeout(1000)
+        h,w = s.getmaxyx()
+        s.clear()
+
+        y_pos = 7
+        startx = int(w / 2 - 25)
+
+        container = self.containers[self.selected_container]
+
+        all_cols = columns + hidden_columns
+        for c in all_cols:
+            value = str(c['value_func'](container))
+            if c['is_bytes']:
+                value = format_bytes(value)
+            spacer = (20 - len(c['header'])) * ' '
+            s.addstr(y_pos, startx+3, '%s:%s%s' % (c['header'], spacer, value))
+            y_pos += 1
+
+        rectangle(s, 5, startx, 8 + len(all_cols), (startx+48))
+        s.refresh()
+        x = s.getch()
+        if x != -1 :
+            self.container_zoom = False
+
+    def _format_containers(self):
+        s = sorted(self.containers.values(),
+                   key=self.sort['func'],
+                   reverse=self.sort['reversed'])
+        return s[self.scroll_pos:]
+
     def _truncate(self, s, max_len):
         i = max_len - 4
         return s[:i] + '...'
-
-    def _sorter(self,d):
-        return d[self.sort['key']]
 
     def _validate_filter(self):
         if not self.filter:
