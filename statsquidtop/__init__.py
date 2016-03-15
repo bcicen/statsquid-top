@@ -22,6 +22,7 @@ _startcol = 2
 class StatSquidClient(object):
     def __init__(self, url):
         self.eventQ = []
+        self.error = None
 
         self._url = url
         self._thread = Thread(target=self._open)
@@ -45,10 +46,10 @@ class StatSquidClient(object):
         self.connected = True
 
     def _error_handler(self, ws, error):
-        log.critical('websocket error:\n %s' % error)
+        self.error = RuntimeError('websocket error:\n %s' % error)
 
     def _exit_handler(self, ws):
-        log.warn('websocket connection closed')
+        self.error = RuntimeError('websocket connection closed')
 
 class StatSquidTop(object):
     def __init__(self, mantle_host, filter=None):
@@ -70,16 +71,27 @@ class StatSquidTop(object):
         while True:
             self.read_from_queue()
             if self.container_zoom:
-                self.display_container()
+                display = self.display_container
             else:
-                self.display()
+                display = self.display
+            try:
+                display()
+            except Exception as ex:
+                self.exit(msg=ex, code=1)
 
     def sig_handler(self, signal, frame):
+        self.exit()
+
+    def exit(self, msg=None, code=0):
         curses.endwin()
-        sys.exit(0)
+        if msg:
+            print('error:', msg)
+        sys.exit(code)
 
     def read_from_queue(self):
         while True:
+            if self.client.error:
+               self.exit(msg=self.client.error, code=1)
             try:
                 event = self.client.eventQ.pop(0)
             except IndexError:
